@@ -1,0 +1,7 @@
+fastapi==0.115.14
+uvicorn[standard]==0.34.3
+numpy==2.2.6
+pandas==2.3.0
+scikit-learn==1.6.1
+econml==0.16.0
+joblib==1.5.1
