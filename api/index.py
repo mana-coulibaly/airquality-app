@@ -1,4 +1,4 @@
-"""API de prédiction et d'analyse causale pour Air Quality."""
+"""API de prediction et d'analyse causale pour Air Quality."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
@@ -35,30 +34,51 @@ def load_scaler() -> Any:
 
 
 @lru_cache(maxsize=1)
-def load_models() -> tuple[Any, Any, Any, Any]:
-    """Charge les modèles une seule fois par instance serverless."""
+def load_classifier() -> Any:
     try:
-        return (
-            joblib.load(MODELS / "model_final_cls.pkl"),
-            joblib.load(MODELS / "model_final.pkl"),
-            load_scaler(),
-            joblib.load(MODELS / "cf.pkl"),
-        )
-    except Exception as exc:  # pragma: no cover - message destiné à l'API
-        raise RuntimeError(f"Impossible de charger les modèles : {exc}") from exc
+        return joblib.load(MODELS / "model_final_cls.pkl")
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"Impossible de charger le classifieur : {exc}") from exc
 
 
-def vectorize(payload: PredictPayload) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+@lru_cache(maxsize=1)
+def load_regressor() -> Any:
+    try:
+        return joblib.load(MODELS / "model_final.pkl")
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"Impossible de charger le regresseur : {exc}") from exc
+
+
+def vectorize(payload: PredictPayload) -> tuple[np.ndarray, np.ndarray]:
     missing = [name for name in W_COLUMNS if name not in payload.W]
     if missing:
         raise HTTPException(status_code=422, detail=f"Variables manquantes : {missing}")
-
     raw_w = np.array([[payload.W[name] for name in W_COLUMNS]], dtype=float)
-    scaler = load_scaler()
-    scaled_w = scaler.transform(raw_w)
-    treatment = np.array([[payload.T]], dtype=float)
-    features = np.concatenate([scaled_w, treatment, np.zeros((1, 1))], axis=1)
-    return raw_w, scaled_w, features
+    scaled_w = load_scaler().transform(raw_w)
+    return raw_w, scaled_w
+
+
+def make_features(scaled_w: np.ndarray, treatment: float) -> np.ndarray:
+    return np.concatenate(
+        [scaled_w, np.array([[treatment]], dtype=float), np.zeros((1, 1))], axis=1
+    )
+
+
+def prediction_outputs(classifier: Any, regressor: Any, scaled_w: np.ndarray, treatment: float) -> dict[str, Any]:
+    features = make_features(scaled_w, treatment)
+    class_pred = int(classifier.predict(features)[0])
+    return {
+        "class_pred": class_pred,
+        "class_label": CLASS_LABELS[class_pred],
+        "proba": classifier.predict_proba(features)[0].tolist(),
+        "y_hat": float(regressor.predict(features)[0]),
+    }
+
+
+def treatment_effect(regressor: Any, scaled_w: np.ndarray) -> float:
+    baseline = float(regressor.predict(make_features(scaled_w, 0.0))[0])
+    treated = float(regressor.predict(make_features(scaled_w, 1.0))[0])
+    return treated - baseline
 
 
 app = FastAPI(title="Air Quality API", version="1.0.0")
@@ -86,11 +106,7 @@ def config() -> dict[str, Any]:
         "class_labels": CLASS_LABELS,
         "stats": {
             **{
-                name: {
-                    "min": float(mean - 3 * scale),
-                    "max": float(mean + 3 * scale),
-                    "mean": float(mean),
-                }
+                name: {"min": float(mean - 3 * scale), "max": float(mean + 3 * scale), "mean": float(mean)}
                 for name, mean, scale in zip(W_COLUMNS, scaler.mean_, scaler.scale_)
             },
             T_NAME: {"min": -100.0, "max": 100.0, "mean": 0.0},
@@ -100,39 +116,32 @@ def config() -> dict[str, Any]:
 
 @app.post("/predict")
 def predict(payload: PredictPayload) -> dict[str, Any]:
-    _, scaled_w, features = vectorize(payload)
-    classifier, regressor, _, causal_forest = load_models()
+    _, scaled_w = vectorize(payload)
+    classifier = load_classifier()
+    regressor = load_regressor()
     try:
-        probabilities = classifier.predict_proba(features)[0].tolist()
-        class_pred = int(classifier.predict(features)[0])
-        y_hat = float(regressor.predict(features)[0])
-        cate = float(causal_forest.effect(scaled_w, T0=np.zeros(1), T1=np.ones(1))[0][0])
+        result = prediction_outputs(classifier, regressor, scaled_w, payload.T)
+        result["cate"] = treatment_effect(regressor, scaled_w)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Erreur de prédiction : {exc}") from exc
-
-    return {
-        "class_pred": class_pred,
-        "class_label": CLASS_LABELS[class_pred],
-        "proba": probabilities,
-        "y_hat": y_hat,
-        "cate": cate,
-    }
+        raise HTTPException(status_code=500, detail=f"Erreur de prediction : {exc}") from exc
+    return result
 
 
 @app.post("/whatif")
 def what_if(payload: PredictPayload, pct: float = Query(-20, ge=-100, le=100)) -> dict[str, Any]:
-    _, scaled_w, _ = vectorize(payload)
-    _, _, _, causal_forest = load_models()
-    current_t = np.array([payload.T], dtype=float)
-    counterfactual_t = np.array([payload.T * (1 + pct / 100)], dtype=float)
+    _, scaled_w = vectorize(payload)
+    classifier = load_classifier()
+    regressor = load_regressor()
+    current_t = float(payload.T)
+    counterfactual_t = current_t * (1 + pct / 100)
     try:
-        current_effect = causal_forest.effect(scaled_w, T0=np.zeros(1), T1=current_t)[0][0]
-        counterfactual_effect = causal_forest.effect(scaled_w, T0=np.zeros(1), T1=counterfactual_t)[0][0]
+        cate = treatment_effect(regressor, scaled_w)
+        current = prediction_outputs(classifier, regressor, scaled_w, current_t)
+        counterfactual = prediction_outputs(classifier, regressor, scaled_w, counterfactual_t)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur de simulation : {exc}") from exc
-
     return {
         "pct": pct,
-        "current": {"treatment": float(current_t[0]), "cate": float(current_effect)},
-        "counterfactual": {"treatment": float(counterfactual_t[0]), "cate": float(counterfactual_effect)},
+        "current": {**current, "treatment": current_t, "cate": cate},
+        "counterfactual": {**counterfactual, "treatment": counterfactual_t, "cate": cate},
     }
