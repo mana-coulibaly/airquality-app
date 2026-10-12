@@ -75,9 +75,16 @@ def prediction_outputs(classifier: Any, regressor: Any, scaled_w: np.ndarray, tr
     }
 
 
-def treatment_effect(regressor: Any, scaled_w: np.ndarray) -> float:
-    baseline = float(regressor.predict(make_features(scaled_w, 0.0))[0])
-    treated = float(regressor.predict(make_features(scaled_w, 1.0))[0])
+def treatment_effect(regressor: Any, scaled_w: np.ndarray, treatment: float) -> float:
+    """Estimate the local effect of one additional NO2 unit.
+
+    The regression model is tree-based and can therefore return the same
+    value over an interval. A zero result means that the prediction did not
+    cross a model threshold between ``treatment`` and ``treatment + 1``;
+    it does not mean that NO2 can never affect the prediction.
+    """
+    baseline = float(regressor.predict(make_features(scaled_w, treatment))[0])
+    treated = float(regressor.predict(make_features(scaled_w, treatment + 1.0))[0])
     return treated - baseline
 
 
@@ -121,7 +128,7 @@ def predict(payload: PredictPayload) -> dict[str, Any]:
     regressor = load_regressor()
     try:
         result = prediction_outputs(classifier, regressor, scaled_w, payload.T)
-        result["cate"] = treatment_effect(regressor, scaled_w)
+        result["cate"] = treatment_effect(regressor, scaled_w, payload.T)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur de prediction : {exc}") from exc
     return result
@@ -135,7 +142,7 @@ def what_if(payload: PredictPayload, pct: float = Query(-20, ge=-100, le=100)) -
     current_t = float(payload.T)
     counterfactual_t = current_t * (1 + pct / 100)
     try:
-        cate = treatment_effect(regressor, scaled_w)
+        cate = treatment_effect(regressor, scaled_w, current_t)
         current = prediction_outputs(classifier, regressor, scaled_w, current_t)
         counterfactual = prediction_outputs(classifier, regressor, scaled_w, counterfactual_t)
     except Exception as exc:
