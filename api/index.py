@@ -27,13 +27,21 @@ class PredictPayload(BaseModel):
 
 
 @lru_cache(maxsize=1)
+def load_scaler() -> Any:
+    try:
+        return joblib.load(MODELS / "scaler_W.pkl")
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"Impossible de charger le scaler : {exc}") from exc
+
+
+@lru_cache(maxsize=1)
 def load_models() -> tuple[Any, Any, Any, Any]:
     """Charge les modèles une seule fois par instance serverless."""
     try:
         return (
             joblib.load(MODELS / "model_final_cls.pkl"),
             joblib.load(MODELS / "model_final.pkl"),
-            joblib.load(MODELS / "scaler_W.pkl"),
+            load_scaler(),
             joblib.load(MODELS / "cf.pkl"),
         )
     except Exception as exc:  # pragma: no cover - message destiné à l'API
@@ -46,7 +54,7 @@ def vectorize(payload: PredictPayload) -> tuple[np.ndarray, np.ndarray, np.ndarr
         raise HTTPException(status_code=422, detail=f"Variables manquantes : {missing}")
 
     raw_w = np.array([[payload.W[name] for name in W_COLUMNS]], dtype=float)
-    _, _, scaler, _ = load_models()
+    scaler = load_scaler()
     scaled_w = scaler.transform(raw_w)
     treatment = np.array([[payload.T]], dtype=float)
     features = np.concatenate([scaled_w, treatment, np.zeros((1, 1))], axis=1)
@@ -71,7 +79,7 @@ def health() -> dict[str, str]:
 
 @app.get("/config")
 def config() -> dict[str, Any]:
-    _, _, scaler, _ = load_models()
+    scaler = load_scaler()
     return {
         "W_columns": W_COLUMNS,
         "T_name": T_NAME,
